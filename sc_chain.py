@@ -70,7 +70,6 @@ def _finish(df: pd.DataFrame, r: float) -> pd.DataFrame:
         if c not in df:
             df[c] = np.nan
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["volume"] = df["volume"].fillna(0)
     df["oi"] = df["oi"].fillna(0)
     df["expiration"] = pd.to_datetime(df["expiration"]).dt.date
     today = dt.date.today()
@@ -297,3 +296,137 @@ def scan_chains(tickers: list[str], dte_min: int, dte_max: int, earnings_days: i
         res = ChainResult(pd.concat([res.df, more.df], ignore_index=True).drop_duplicates("symbol"),
                           res.warnings + more.warnings, res.cost_usd + more.cost_usd, "Apify")
     return res
+
+
+# ---------------- Alpaca provider (free paper account, works from cloud servers) ----------------
+
+ALPACA_DATA = "https://data.alpaca.markets"
+ALPACA_TRADE = "https://paper-api.alpaca.markets"
+
+
+def _alpaca_get(url: str, key: str, secret: str, params: dict) -> dict:
+    h = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret, "accept": "application/json"}
+    for attempt in range(3):
+        r = requests.get(url, headers=h, params=params, timeout=30)
+        if r.status_code == 429:
+            time.sleep(2 + attempt * 3)
+            continue
+        if r.status_code in (401, 403):
+            raise RuntimeError("Alpaca rejected the API keys. Check the key and secret.")
+        r.raise_for_status()
+        return r.json()
+    raise RuntimeError("Alpaca rate limit hit. Wait a minute and scan again.")
+
+
+def _alpaca_paged(url, key, secret, params, list_key):
+    out, token = ([] if list_key != "snapshots" else {}), None
+    for _ in range(20):
+        p = dict(params)
+        if token:
+            p["page_token"] = token
+        d = _alpaca_get(url, key, secret, p)
+        part = d.get(list_key) or ([] if list_key != "snapshots" else {})
+        if isinstance(out, dict):
+            out.update(part)
+        else:
+            out.extend(part)
+        token = d.get("next_page_token")
+        if not token:
+            break
+    return out
+
+
+def alpaca_spots(tickers, key, secret) -> dict:
+    d = _alpaca_get(f"{ALPACA_DATA}/v2/stocks/snapshots", key, secret,
+                    {"symbols": ",".join(tickers), "feed": "iex"})
+    out = {}
+    for t, snap in (d.items() if isinstance(d, dict) else []):
+        px = ((snap or {}).get("latestTrade") or {}).get("p") or ((snap or {}).get("dailyBar") or {}).get("c")
+        if px:
+            out[t] = float(px)
+    return out
+
+
+def fetch_alpaca(tickers, targets: dict, window_pct: float, key: str, secret: str) -> ChainResult:
+    by_ticker = defaultdict(list)
+    for exp, tks in targets.items():
+        for t in tks:
+            by_ticker[t].append(exp)
+    warns, frames = [], []
+    spots = alpaca_spots(list(by_ticker), key, secret)
+    for t, exps in by_ticker.items():
+        S = spots.get(t)
+        if not S:
+            warns.append(f"{t}: no stock price from Alpaca.")
+            continue
+        lo, hi = round(S * (1 - window_pct / 100), 2), round(S * (1 + window_pct / 100), 2)
+        try:
+            contracts = _alpaca_paged(f"{ALPACA_TRADE}/v2/options/contracts", key, secret, {
+                "underlying_symbols": t, "status": "active", "limit": 1000,
+                "expiration_date_gte": (min(exps) - dt.timedelta(days=3)).isoformat(),
+                "expiration_date_lte": (max(exps) + dt.timedelta(days=3)).isoformat(),
+                "strike_price_gte": lo, "strike_price_lte": hi}, "option_contracts")
+        except Exception as exc:
+            warns.append(f"{t}: {exc}")
+            continue
+        if not contracts:
+            warns.append(f"{t}: no listed options near the target dates.")
+            continue
+        listed = sorted({dt.date.fromisoformat(c["expiration_date"]) for c in contracts})
+        chosen = set()
+        for e in exps:
+            best = min(listed, key=lambda x: abs((x - e).days))
+            if abs((best - e).days) <= 3:
+                chosen.add(best)
+        oi = {c["symbol"]: c.get("open_interest") for c in contracts}
+        for e in sorted(chosen):
+            try:
+                snaps = _alpaca_paged(f"{ALPACA_DATA}/v1beta1/options/snapshots/{t}", key, secret, {
+                    "feed": "indicative", "expiration_date": e.isoformat(), "limit": 1000,
+                    "strike_price_gte": lo, "strike_price_lte": hi}, "snapshots")
+            except Exception as exc:
+                warns.append(f"{t} {e}: {exc}")
+                continue
+            rows = []
+            for c in contracts:
+                if dt.date.fromisoformat(c["expiration_date"]) != e:
+                    continue
+                sn = snaps.get(c["symbol"]) or {}
+                q, g = sn.get("latestQuote") or {}, sn.get("greeks") or {}
+                bar = sn.get("dailyBar") or {}
+                rows.append({
+                    "ticker": t, "symbol": c["symbol"], "type": c.get("type"), "strike": float(c["strike_price"]),
+                    "expiration": e, "spot": S, "bid": q.get("bp"), "ask": q.get("ap"),
+                    "last": (sn.get("latestTrade") or {}).get("p"), "volume": bar.get("v"),
+                    "oi": oi.get(c["symbol"]), "iv": sn.get("impliedVolatility"), "delta": g.get("delta"),
+                })
+            if rows:
+                frames.append(pd.DataFrame(rows))
+            time.sleep(0.2)
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not df.empty:
+        earn = {}
+        try:
+            earn = upcoming_earnings_yahoo(list(df.ticker.unique()))
+        except Exception:
+            pass
+        df["earnings_date"] = df.ticker.map(earn)
+        if not earn:
+            warns.append("Earnings dates unavailable from this server, so the Earnings tab may be empty.")
+    return ChainResult(_finish(df, SETTINGS.risk_free_rate), warns, 0.0, "Alpaca")
+
+
+def scan_chains_alpaca(tickers, dte_min, dte_max, earnings_days, window_pct, key, secret) -> ChainResult:
+    tickers = [t.strip().upper() for t in tickers if t.strip()]
+    months = monthly_expiries(dte_min, dte_max) or monthly_expiries(dte_min, dte_max + 21)[:1]
+    targets = {m: list(tickers) for m in months}
+    today = dt.date.today()
+    try:
+        for t, ts in upcoming_earnings_yahoo(tickers).items():
+            d = ts.date()
+            if 0 <= (d - today).days <= earnings_days:
+                targets.setdefault(expiry_after(d), []).append(t)
+    except Exception:
+        pass
+    wide = max(window_pct, 15) if len(targets) > len(months) else window_pct
+    return fetch_alpaca(tickers, targets, wide, key, secret)

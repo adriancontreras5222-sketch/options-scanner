@@ -1,4 +1,4 @@
-"""Options Scanner, public web version. Free Yahoo data, no keys, one private session per visitor."""
+"""Options Scanner, public web version. Free Alpaca data, one private session per visitor."""
 from __future__ import annotations
 
 import datetime as dt
@@ -88,9 +88,18 @@ HEAD = {"dte": "Days", "prob_profit": "Win chance", "ev": "Exp. value", "ev_per_
 def big_table(df: pd.DataFrame, formats: dict, n: int):
     """HTML table so the text-size slider applies (the interactive grid ignores CSS)."""
     t = df.head(n).copy()
+    def safe(f):
+        def g(x):
+            try:
+                if x is None or (isinstance(x, float) and math.isnan(x)):
+                    return ""
+                return f(x)
+            except Exception:
+                return str(x)
+        return g
     for col, f in formats.items():
         if col in t:
-            t[col] = t[col].map(f)
+            t[col] = t[col].map(safe(f))
     t.index = range(1, len(t) + 1)
     t.columns = [HEAD.get(c, c.replace("_", " ").capitalize()) for c in t.columns]
     st.markdown(f'<div style="overflow-x:auto">{t.to_html(escape=True).replace("$", "&#36;")}</div>',
@@ -100,6 +109,20 @@ def big_table(df: pd.DataFrame, formats: dict, n: int):
 # ---------------- sidebar ----------------
 st.sidebar.header("Scan settings")
 tick_text = st.sidebar.text_area("Tickers (space separated)", SETTINGS.watchlist, height=110)
+def _secret(name):
+    try:
+        return st.secrets.get(name, "")
+    except Exception:
+        return ""
+
+
+ALPACA_KEY, ALPACA_SECRET = _secret("ALPACA_KEY"), _secret("ALPACA_SECRET")
+if not (ALPACA_KEY and ALPACA_SECRET):
+    with st.sidebar.expander("Data keys (free Alpaca account)", expanded=True):
+        st.write("This site has no data key set. Create a free paper account at alpaca.markets with just an email, "
+                 "then paste its paper API key and secret here. They stay in your browser session.")
+        ALPACA_KEY = st.text_input("Alpaca API key", type="password")
+        ALPACA_SECRET = st.text_input("Alpaca secret", type="password")
 tickers = list(dict.fromkeys(t.upper() for t in tick_text.replace(",", " ").split() if t.strip()))
 if len(tickers) > MAX_TICKERS:
     st.sidebar.warning(f"Using the first {MAX_TICKERS} tickers. Scans are capped to keep the free data source working.")
@@ -127,7 +150,8 @@ rules = strategies.Rules(account=account, risk_pct=risk_pct, min_oi=min_oi, min_
 
 # ---------------- header & scan ----------------
 st.title("Options Scanner")
-box("Educational tool, not investment advice. Data is free, delayed Yahoo Finance data and can be wrong or missing. "
+box("Educational tool, not investment advice. Option data is Alpaca's free feed: delayed, with approximate bid/ask "
+    "quotes. It can be wrong or missing. "
     "Options can lose more than you expect. Check every price with your broker before trading.", "warn")
 months = data_chain.monthly_expiries(dte_min, dte_max)
 st.write(f"Scanning {len(tickers)} tickers. Monthly expiries: {', '.join(m.strftime('%b %d') for m in months) or 'none in range'}, "
@@ -135,15 +159,15 @@ st.write(f"Scanning {len(tickers)} tickers. Monthly expiries: {', '.join(m.strft
 
 
 @st.cache_data(ttl=900, show_spinner=False, max_entries=50)
-def run_scan(tks: tuple, dmin: int, dmax: int, edays: int, win: int) -> dict:
-    """Shared across visitors for 15 minutes so identical scans do not hit Yahoo twice."""
-    res = data_chain.scan_chains(list(tks), dmin, dmax, edays, win, "yahoo", 0.0)
+def run_scan(tks: tuple, dmin: int, dmax: int, edays: int, win: int, _key: str, _secret: str) -> dict:
+    """Shared across visitors for 15 minutes so identical scans do not hit the data source twice."""
+    res = data_chain.scan_chains_alpaca(list(tks), dmin, dmax, edays, win, _key, _secret)
     chain = res.df
     profiles, history, warns = {}, {}, list(res.warnings)
     for t in tks:
-        bars, _ = data_history.get_bars(t, use_massive=False)
+        bars, _ = data_history.get_bars(t, use_massive=False, alpaca=(_key, _secret))
         if bars is None or bars.empty:
-            warns.append(f"{t}: no price history from Yahoo.")
+            warns.append(f"{t}: no price history.")
         profiles[t] = vol.stock_profile(bars)
         ct = chain[chain.ticker == t]
         if not ct.empty and profiles[t]:
@@ -156,17 +180,18 @@ def run_scan(tks: tuple, dmin: int, dmax: int, edays: int, win: int) -> dict:
                 if 0 <= (ed - dt.date.today()).days <= edays:
                     history[t] = vol.earnings_moves(bars, data_history.past_earnings(t))
     if chain.empty:
-        warns.append("Yahoo returned no option data. It may be rate limiting this server. Wait a few minutes and try again.")
+        warns.append("No option data came back. Check the Alpaca keys, or wait a minute and try again.")
     return {"time": dt.datetime.now(), "chain": chain, "profiles": profiles, "history": history,
-            "warnings": warns, "cost": 0.0, "provider": "Yahoo"}
+            "warnings": warns, "cost": 0.0, "provider": "Alpaca"}
 
 
-if st.button("Run scan", type="primary", width="stretch", disabled=not tickers):
+if st.button("Run scan", type="primary", width="stretch", disabled=not (tickers and ALPACA_KEY and ALPACA_SECRET)):
     with st.spinner("Fetching option chains and price history. About a minute..."):
         try:
-            st.session_state["scan"] = run_scan(tuple(tickers), int(dte_min), int(dte_max), int(earn_days), int(window))
+            st.session_state["scan"] = run_scan(tuple(tickers), int(dte_min), int(dte_max), int(earn_days), int(window),
+                                               ALPACA_KEY, ALPACA_SECRET)
         except Exception as exc:
-            st.error(f"Scan failed: {exc}. Yahoo may be busy. Try again in a few minutes.")
+            st.error(f"Scan failed: {exc}")
             st.stop()
 
 scan = st.session_state.get("scan")
@@ -362,7 +387,7 @@ with tabs[4]:
 with tabs[5]:
     st.header("How it works")
     st.markdown("""
-**Data.** Option chains, price history and earnings dates all come from Yahoo Finance for free.
+**Data.** Option chains, greeks and open interest come from Alpaca's free indicative feed. Its trades are delayed and its bid/ask quotes are adjusted, so treat spreads as approximate. Prices come from Alpaca (IEX). Earnings dates come from Yahoo when it answers.
 Quotes are delayed. Treat every number as a starting point and confirm in your broker before you trade.
 
 **Fills.** The scanner never assumes you fill at mid. The slippage slider moves your fill toward the bad side

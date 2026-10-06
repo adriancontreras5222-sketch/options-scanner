@@ -37,7 +37,7 @@ class Rules:
 # ---------------- helpers ----------------
 
 def liquid(df: pd.DataFrame, rules: Rules) -> pd.DataFrame:
-    return df[(df.bid > 0) & (df.ask > df.bid) & (df.oi >= rules.min_oi) & (df.volume >= rules.min_volume)
+    return df[(df.bid > 0) & (df.ask > df.bid) & (df.oi >= rules.min_oi) & (df.volume.isna() | (df.volume >= rules.min_volume))
               & (df.spread_pct <= rules.max_spread_pct)]
 
 

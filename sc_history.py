@@ -61,7 +61,21 @@ def _yahoo_bars(ticker: str, days: int) -> pd.DataFrame:
     return h[["date", "open", "high", "low", "close", "volume"]]
 
 
-def get_bars(ticker: str, days: int = 400, use_massive: bool = True) -> tuple[pd.DataFrame, str]:
+def _alpaca_bars(ticker: str, days: int, key: str, secret: str) -> pd.DataFrame:
+    start = (dt.date.today() - dt.timedelta(days=int(days * 1.5))).isoformat()
+    h = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
+    r = requests.get(f"https://data.alpaca.markets/v2/stocks/{ticker}/bars", headers=h, timeout=30,
+                     params={"timeframe": "1Day", "start": start, "limit": 10000, "adjustment": "all", "feed": "iex"})
+    r.raise_for_status()
+    bars = r.json().get("bars") or []
+    if not bars:
+        return pd.DataFrame()
+    df = pd.DataFrame(bars).rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+    df["date"] = pd.to_datetime(df["t"]).dt.tz_convert("America/New_York").dt.date
+    return df[["date", "open", "high", "low", "close", "volume"]]
+
+
+def get_bars(ticker: str, days: int = 400, use_massive: bool = True, alpaca: tuple | None = None) -> tuple[pd.DataFrame, str]:
     """Returns (bars, source). Bars are daily, oldest first."""
     p = _cache_path("bars", ticker)
     if p.exists():
@@ -69,7 +83,12 @@ def get_bars(ticker: str, days: int = 400, use_massive: bool = True) -> tuple[pd
         df["date"] = df["date"].dt.date
         return df, "cache"
     df, src = pd.DataFrame(), ""
-    if use_massive and SETTINGS.massive_key:
+    if alpaca:
+        try:
+            df, src = _alpaca_bars(ticker, days, *alpaca), "Alpaca"
+        except Exception:
+            df = pd.DataFrame()
+    if df.empty and use_massive and SETTINGS.massive_key:
         try:
             df, src = _massive_bars(ticker, days), "Massive"
         except Exception:
